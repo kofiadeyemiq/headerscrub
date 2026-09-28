@@ -40,6 +40,14 @@ current Go toolchain with two `httptest` servers reached via different
 hostnames on the same machine (see `TestLeakRepro` in
 `headerscrub_test.go`, and `examples/leak-demo` above).
 
+Headers are matched by their canonical form regardless of how they were
+set, including a header assigned directly on the `Header` map with a
+non-canonical key (`req.Header["x-api-key"] = ...` instead of
+`req.Header.Set(...)`, which is legal — `http.Header` is just a
+`map[string][]string`). An earlier version of this package used
+`Header.Del`, which canonicalizes its argument before deleting and so
+missed exactly that case; see `TestCheckRedirect_NonCanonicalKeyIsScrubbed`.
+
 ## Install
 
 ```sh
@@ -78,10 +86,18 @@ logic.
 | Option | Default | What it does |
 | --- | --- | --- |
 | `Allow(names ...string)` | `Accept`, `Accept-Language`, `User-Agent` | Replaces the allowlist of headers that survive a cross-origin hop. Not additive — list everything you want kept. |
-| `Wrap(next)` | none | Runs an existing `CheckRedirect` function after the scrubbing logic, so redirect-count limits, URL allowlists, or logging keep working. |
+| `Wrap(next)` | none | Runs an existing `CheckRedirect` function after the scrubbing logic, so URL allowlists or logging keep working. |
 
-The returned policy preserves the standard library's default 10-redirect
-limit on its own; you don't need `Wrap` just to keep that.
+The returned policy enforces the standard library's default 10-redirect
+limit **only when no `Wrap` is used.** As soon as you wrap an existing
+`CheckRedirect`, the limit is delegated to it entirely — `headerscrub`
+doesn't second-guess it. This matters if you wrap a function that's meant
+to allow more than 10 hops: without delegating, this package's own cap
+would silently override it. If you wrap a function that doesn't enforce
+any limit of its own, redirects are unbounded (aside from whatever
+`net/http`'s connection handling eventually does), same as it would be if
+you'd passed that function to `http.Client.CheckRedirect` directly. See
+`TestWrap_DelegatesRedirectLimit`.
 
 ## Same origin, not same domain
 
@@ -98,6 +114,34 @@ subdomain takeover and multi-tenant hosting are both real. Matching the
 permissive rule here would leave a gap for exactly the redirect shapes this
 package exists to catch. If you do want specific headers to follow a known
 family of subdomains, list them with `Allow`.
+
+## 307 and 308: the body goes too
+
+A 307 or 308 redirect tells the client to repeat the request exactly,
+including its method and body — unlike 301/302/303, which `net/http`
+downgrades a `POST` to a `GET` and drops the body for. So a cross-origin
+307/308 resends whatever body the original request had to the new host,
+same as `net/http` would do without this package installed.
+
+`headerscrub` does not scrub or inspect that body — doing so is out of
+scope for a header-only policy, and if a body is going to leak on a 307
+regardless, hiding that behind a false sense of security would be worse
+than being upfront about it. What it does do is keep `Content-Type`,
+`Content-Encoding`, `Content-Language` and `Content-Location` on a hop that
+still carries a body, in addition to whatever's in your allowlist — those
+headers describe the payload rather than the caller, and stripping them
+would leave the server holding a body it can't interpret while doing
+nothing for security. Every other header is still scrubbed as usual on a
+cross-origin body-preserving hop; see `TestCheckRedirect_307KeepsBodyAndContentType`.
+
+If a redirect chain includes a 301/302/303 hop, `net/http` drops the body
+itself before this package's logic runs at all, and `Content-Type` is then
+treated like any other non-allowlisted header — scrubbed on a cross-origin
+hop, same as `X-Api-Key` — since there's no body left for it to describe;
+see `TestCheckRedirect_302DowngradesToGETNoBody`. If your request body
+might itself contain a secret, don't rely on this package to protect it on
+a 307/308 — that's a URL/redirect-policy decision (see below), not a
+header-scrubbing one.
 
 ## What it does not do
 

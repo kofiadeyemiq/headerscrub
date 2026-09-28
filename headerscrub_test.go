@@ -2,6 +2,7 @@ package headerscrub_test
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -345,5 +346,228 @@ func TestClient_WrapsExistingCheckRedirect(t *testing.T) {
 	}
 	if key := got.Get("X-Api-Key"); key != "" {
 		t.Fatalf("expected X-Api-Key still scrubbed via Client(), got %q", key)
+	}
+}
+
+// TestCheckRedirect_NonCanonicalKeyIsScrubbed is a regression test for a
+// leak found in review: setting a header directly on the map with a
+// non-canonical key (req.Header["x-api-key"] = ..., which is legal - a
+// Header is just a map[string][]string) survived scrubbing, because
+// http.Header.Del canonicalizes its argument before deleting and so never
+// matched the non-canonical map key net/http's own header-copying had
+// carried over verbatim. The fix deletes the exact original map key
+// instead of a canonicalized guess at it.
+func TestCheckRedirect_NonCanonicalKeyIsScrubbed(t *testing.T) {
+	var got http.Header
+	originURL, cleanup := newRedirectPair(t, &got)
+	defer cleanup()
+
+	client := headerscrub.Client(nil)
+
+	req, err := http.NewRequest(http.MethodGet, originURL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header["x-api-key"] = []string{"LOWER-SECRET"} // bypasses Set's canonicalization
+	req.Header.Set("X-Auth-Token", "canonical-secret") // canonical, for contrast
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	if key := got.Get("X-Api-Key"); key != "" {
+		t.Fatalf("expected non-canonical x-api-key to be scrubbed, got %q", key)
+	}
+	if token := got.Get("X-Auth-Token"); token != "" {
+		t.Fatalf("expected canonical X-Auth-Token to still be scrubbed, got %q", token)
+	}
+}
+
+// TestAllow_NonCanonicalAllowMatchesNonCanonicalKey confirms an allowlist
+// name and a request header key are both compared by their canonical
+// form, regardless of how either one was spelled.
+func TestAllow_NonCanonicalAllowMatchesNonCanonicalKey(t *testing.T) {
+	var got http.Header
+	originURL, cleanup := newRedirectPair(t, &got)
+	defer cleanup()
+
+	client := &http.Client{
+		CheckRedirect: headerscrub.CheckRedirect(headerscrub.Allow("accept")),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, originURL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header["accept"] = []string{"application/json"} // non-canonical key
+	req.Header["x-api-key"] = []string{"super-secret"}  // non-canonical, not allowlisted
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	if accept := got.Get("Accept"); accept != "application/json" {
+		t.Fatalf("expected a non-canonically-spelled Allow() entry to match a non-canonical header key, got %q", accept)
+	}
+	if key := got.Get("X-Api-Key"); key != "" {
+		t.Fatalf("expected a non-allowlisted non-canonical header to still be scrubbed, got %q", key)
+	}
+}
+
+// bodyReceived captures what a target server actually received, for the
+// 307/308 body-preservation tests below.
+type bodyReceived struct {
+	method      string
+	body        []byte
+	contentType string
+	header      http.Header
+}
+
+// newBodyRedirectPair starts two httptest servers reached via different
+// hostnames (like newRedirectPair) where the origin redirects to the
+// target with the given status code, preserving whatever method and body
+// that status code implies.
+func newBodyRedirectPair(t *testing.T, status int) (originURL string, got *bodyReceived, cleanup func()) {
+	t.Helper()
+	got = &bodyReceived{}
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got.method = r.Method
+		got.body = b
+		got.contentType = r.Header.Get("Content-Type")
+		got.header = r.Header.Clone()
+	}))
+	targetViaOtherHost := strings.Replace(target.URL, "127.0.0.1", "localhost", 1)
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", targetViaOtherHost)
+		w.WriteHeader(status)
+	}))
+
+	return origin.URL, got, func() {
+		origin.Close()
+		target.Close()
+	}
+}
+
+// TestCheckRedirect_307KeepsBodyAndContentType is a regression test for a
+// correctness bug found in review: a cross-origin 307/308 resends the
+// request body (net/http preserves method and body for those codes), but
+// the policy was stripping Content-Type along with everything else,
+// leaving the server unable to interpret the body it just received.
+// Content-Type (and the other headers in bodyHeaders) must survive
+// whenever the hop still carries a body; the body itself is resent as-is
+// and is not scrubbed - see the README.
+func TestCheckRedirect_307KeepsBodyAndContentType(t *testing.T) {
+	originURL, got, cleanup := newBodyRedirectPair(t, http.StatusTemporaryRedirect)
+	defer cleanup()
+
+	client := &http.Client{CheckRedirect: headerscrub.CheckRedirect()}
+
+	body := `{"x":1}`
+	req, err := http.NewRequest(http.MethodPost, originURL, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", "super-secret")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	if got.method != http.MethodPost {
+		t.Fatalf("expected a 307 to preserve POST, got %q", got.method)
+	}
+	if string(got.body) != body {
+		t.Fatalf("expected the body to be resent on a cross-origin 307, got %q", got.body)
+	}
+	if got.contentType != "application/json" {
+		t.Fatalf("expected Content-Type to survive a cross-origin 307 that resends the body, got %q", got.contentType)
+	}
+	if key := got.header.Get("X-Api-Key"); key != "" {
+		t.Fatalf("expected X-Api-Key to still be scrubbed even though the body is kept, got %q", key)
+	}
+}
+
+// TestCheckRedirect_302DowngradesToGETNoBody is a companion to the 307
+// test above: a 302 makes net/http itself convert POST to GET and drop the
+// body (redirectBehavior in client.go), before headerscrub's own logic
+// ever runs. With no body on the hop, Content-Type is treated like any
+// other non-allowlisted header and scrubbed, matching net/http's own
+// behavior for a POST-to-GET downgrade.
+func TestCheckRedirect_302DowngradesToGETNoBody(t *testing.T) {
+	originURL, got, cleanup := newBodyRedirectPair(t, http.StatusFound)
+	defer cleanup()
+
+	client := &http.Client{CheckRedirect: headerscrub.CheckRedirect()}
+
+	req, err := http.NewRequest(http.MethodPost, originURL, strings.NewReader(`{"x":1}`))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	resp.Body.Close()
+
+	if got.method != http.MethodGet {
+		t.Fatalf("expected a 302 to downgrade POST to GET per net/http's own behavior, got %q", got.method)
+	}
+	if len(got.body) != 0 {
+		t.Fatalf("expected no body on a GET-downgraded redirect, got %q", got.body)
+	}
+	if got.contentType != "" {
+		t.Fatalf("expected Content-Type to be scrubbed when no body is resent, got %q", got.contentType)
+	}
+}
+
+// TestWrap_DelegatesRedirectLimit is a regression test for a behavior
+// found in review: CheckRedirect always enforced its own 10-hop cap even
+// when Wrap chained in a policy that permits more, silently overriding it.
+// When next is set, the limit is fully delegated to it.
+func TestWrap_DelegatesRedirectLimit(t *testing.T) {
+	var srv *httptest.Server
+	const hops = 15 // more than the built-in 10-hop cap
+	count := 0
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count++
+		if count > hops {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Location", srv.URL+"/"+strings.Repeat("x", count))
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	permissive := func(req *http.Request, via []*http.Request) error {
+		return nil // no limit of its own
+	}
+
+	client := &http.Client{
+		CheckRedirect: headerscrub.CheckRedirect(headerscrub.Wrap(permissive)),
+	}
+	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("expected wrapping a permissive CheckRedirect to allow more than 10 hops, got error: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected the redirect chain to complete, got status %d", resp.StatusCode)
 	}
 }
