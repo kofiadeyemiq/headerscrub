@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 
-	"github.com/__GH_OWNER__/headerscrub"
+	"github.com/kofiadeyemiq/headerscrub"
 )
 
 func main() {

@@ -1,3 +1,3 @@
-module github.com/__GH_OWNER__/headerscrub
+module github.com/kofiadeyemiq/headerscrub
 
 go 1.23

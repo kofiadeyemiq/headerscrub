@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/__GH_OWNER__/headerscrub"
+	"github.com/kofiadeyemiq/headerscrub"
 )
 
 // newRedirectPair starts two httptest servers and returns the origin

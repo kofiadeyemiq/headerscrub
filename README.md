@@ -41,7 +41,7 @@ Both requests set the same two headers. `Authorization` never reaches the second
 ## Installation
 
 ```sh
-go get github.com/__GH_OWNER__/headerscrub
+go get github.com/kofiadeyemiq/headerscrub
 ```
 
 Go 1.23+. No dependencies outside the standard library.
